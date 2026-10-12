@@ -190,70 +190,41 @@ pub const Signal = enum {
     };
 };
 
-const OtlpIdValue = struct {
-    field_start: usize,
-    value_start: usize,
-    value_end: usize,
-};
-
-fn nextOtlpIdValue(json: []const u8, start: usize) ?OtlpIdValue {
-    const fields = [_][]const u8{
-        "\"traceId\":\"",
-        "\"spanId\":\"",
-        "\"parentSpanId\":\"",
-    };
-    var next: ?OtlpIdValue = null;
-
-    for (fields) |field| {
-        const field_start = std.mem.indexOfPos(u8, json, start, field) orelse continue;
-        if (next != null and next.?.field_start <= field_start) continue;
-
-        const value_start = field_start + field.len;
-        const value_len = std.mem.indexOfScalar(u8, json[value_start..], '"') orelse continue;
-        next = .{
-            .field_start = field_start,
-            .value_start = value_start,
-            .value_end = value_start + value_len,
-        };
-    }
-
-    return next;
-}
-
-fn encodeOtlpIdsAsHex(json: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    const digits = "0123456789abcdef";
-    var output = std.Io.Writer.Allocating.init(allocator);
-    errdefer output.deinit();
-
-    var cursor: usize = 0;
-    var search_from: usize = 0;
-    while (nextOtlpIdValue(json, search_from)) |match| {
-        try output.writer.writeAll(json[cursor..match.value_start]);
-
-        const encoded = json[match.value_start..match.value_end];
-        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
-        var decoded: [16]u8 = undefined;
-        if (decoded_len > decoded.len) return error.InvalidOtlpIdentifier;
-        try std.base64.standard.Decoder.decode(decoded[0..decoded_len], encoded);
-
-        for (decoded[0..decoded_len]) |byte| {
-            try output.writer.writeByte(digits[byte >> 4]);
-            try output.writer.writeByte(digits[byte & 0x0f]);
-        }
-
-        cursor = match.value_end;
-        search_from = match.value_end;
-    }
-
-    try output.writer.writeAll(json[cursor..]);
-    return output.toOwnedSlice();
-}
-
+/// OTLP/JSON requires trace and span IDs as hex strings, while protobuf JSON encodes bytes as base64.
+/// See https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding
+// TODO: drop the rewrite once zig-protobuf can customize bytes encoding (Arwalk/zig-protobuf#176).
 fn encodeOtlpJson(data: anytype, allocator: std.mem.Allocator) ![]const u8 {
     const json = try protobuf.json.encode(data, .{}, .{ .emit_oneof_field_name = false }, allocator);
-    if (nextOtlpIdValue(json, 0) == null) return json;
     defer allocator.free(json);
-    return encodeOtlpIdsAsHex(json, allocator);
+
+    var out: std.Io.Writer.Allocating = try .initCapacity(allocator, json.len);
+    errdefer out.deinit();
+
+    // Quotes inside JSON strings are escaped, so this only matches the end of an object key.
+    const key_end = "Id\":\"";
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, json, cursor, key_end)) |key_pos| {
+        const value_start = key_pos + key_end.len;
+        try out.writer.writeAll(json[cursor..value_start]);
+        cursor = value_start;
+
+        const key = json[0 .. key_pos + "Id".len];
+        if (!std.mem.endsWith(u8, key, "\"traceId") and
+            !std.mem.endsWith(u8, key, "\"spanId") and
+            !std.mem.endsWith(u8, key, "\"parentSpanId")) continue;
+
+        // Base64 has no quotes, so the next one closes the value.
+        const value_end = std.mem.indexOfScalarPos(u8, json, value_start, '"').?;
+        const encoded = json[value_start..value_end];
+        var id: [16]u8 = undefined;
+        const id_len = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+        if (id_len > id.len) return error.InvalidOtlpIdentifier;
+        try std.base64.standard.Decoder.decode(id[0..id_len], encoded);
+        try out.writer.printHex(id[0..id_len], .lower);
+        cursor = value_end;
+    }
+    try out.writer.writeAll(json[cursor..]);
+    return out.toOwnedSlice();
 }
 
 test "otlp Signal.Data get payload bytes" {
@@ -1026,48 +997,46 @@ pub fn ExportFile(
     try file.sync(io);
 }
 
-test "OTLP JSON encodes trace identifiers as lowercase hex" {
+test "otlp http_json encodes trace and span IDs as lowercase hex" {
     const allocator = std.testing.allocator;
     const trace_id = [16]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe };
     const span_id = [8]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
     const parent_span_id = [8]u8{ 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
 
-    var attributes: std.ArrayList(pbcommon.KeyValue) = .empty;
-    defer attributes.deinit(allocator);
-    try attributes.append(allocator, .{
-        .key = "bytes",
-        .value = .{ .value = .{ .bytes_value = &span_id } },
-    });
-
-    var links: std.ArrayList(pbtrace.Span.Link) = .empty;
-    defer links.deinit(allocator);
-    try links.append(allocator, .{ .trace_id = &trace_id, .span_id = &span_id });
-
-    var spans: std.ArrayList(pbtrace.Span) = .empty;
-    defer spans.deinit(allocator);
-    try spans.append(allocator, .{
+    var attributes = [_]pbcommon.KeyValue{.{ .key = "bytes", .value = .{ .value = .{ .bytes_value = &span_id } } }};
+    var links = [_]pbtrace.Span.Link{.{ .trace_id = &trace_id, .span_id = &span_id }};
+    var spans = [_]pbtrace.Span{.{
         .trace_id = &trace_id,
         .span_id = &span_id,
         .parent_span_id = &parent_span_id,
-        .attributes = attributes,
-        .links = links,
-    });
+        .attributes = .fromOwnedSlice(&attributes),
+        .links = .fromOwnedSlice(&links),
+    }};
+    var scope_spans = [_]pbtrace.ScopeSpans{.{ .spans = .fromOwnedSlice(&spans) }};
+    var resource_spans = [_]pbtrace.ResourceSpans{.{ .scope_spans = .fromOwnedSlice(&scope_spans) }};
+    const traces = try (Signal.Data{ .traces = .{ .resource_spans = .fromOwnedSlice(&resource_spans) } }).toOwnedSlice(allocator, .http_json);
+    defer allocator.free(traces);
 
-    var scope_spans: std.ArrayList(pbtrace.ScopeSpans) = .empty;
-    defer scope_spans.deinit(allocator);
-    try scope_spans.append(allocator, .{ .spans = spans });
+    try std.testing.expectEqual(2, std.mem.count(u8, traces, "\"traceId\":\"0123456789abcdef1032547698badcfe\""));
+    try std.testing.expectEqual(2, std.mem.count(u8, traces, "\"spanId\":\"0123456789abcdef\""));
+    try std.testing.expect(std.mem.indexOf(u8, traces, "\"parentSpanId\":\"fedcba9876543210\"") != null);
+    // Other bytes fields keep the protobuf JSON base64 encoding.
+    try std.testing.expect(std.mem.indexOf(u8, traces, "\"bytesValue\":\"ASNFZ4mrze8=\"") != null);
 
-    var resource_spans: std.ArrayList(pbtrace.ResourceSpans) = .empty;
-    defer resource_spans.deinit(allocator);
-    try resource_spans.append(allocator, .{ .scope_spans = scope_spans });
+    var log_records = [_]pblogs.LogRecord{
+        .{ .trace_id = &trace_id, .span_id = &span_id, .body = .{ .value = .{ .string_value = "\"traceId\":\"AAAA\"" } } },
+        // Logs emitted outside a span carry empty IDs.
+        .{},
+    };
+    var scope_logs = [_]pblogs.ScopeLogs{.{ .log_records = .fromOwnedSlice(&log_records) }};
+    var resource_logs = [_]pblogs.ResourceLogs{.{ .scope_logs = .fromOwnedSlice(&scope_logs) }};
+    const logs = try (Signal.Data{ .logs = .{ .resource_logs = .fromOwnedSlice(&resource_logs) } }).toOwnedSlice(allocator, .http_json);
+    defer allocator.free(logs);
 
-    const payload = try (Signal.Data{ .traces = .{ .resource_spans = resource_spans } }).toOwnedSlice(allocator, .http_json);
-    defer allocator.free(payload);
-
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, payload, "\"traceId\":\"0123456789abcdef1032547698badcfe\""));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, payload, "\"spanId\":\"0123456789abcdef\""));
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"parentSpanId\":\"fedcba9876543210\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"bytesValue\":\"ASNFZ4mrze8=\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logs, "\"traceId\":\"0123456789abcdef1032547698badcfe\",\"spanId\":\"0123456789abcdef\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logs, "\"traceId\":\"\",\"spanId\":\"\"") != null);
+    // A key-like sequence inside a string value is left untouched.
+    try std.testing.expect(std.mem.indexOf(u8, logs, "\"stringValue\":\"\\\"traceId\\\":\\\"AAAA\\\"\"") != null);
 }
 
 // Integration tests
